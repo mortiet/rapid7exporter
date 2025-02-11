@@ -1,0 +1,23 @@
+retention: 130
+latestScan: true
+updatePeriod: 1440
+loglevel: warn
+severities:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+  - LOW
+dummyApps:
+  - id: "dummy-001"
+    name: "pf-haptoatlas"
+renameApps:
+  "vivax.malariagen.net": "roma"
+  "spotmalaria.malariagen.net": "roma"
+  "vobs.malariagen.net": "roma"
+  "glad.malariagen.net": "roma"
+  "lookseq-mystudies-uat.gsu.sanger.ac.uk/mystudies": "mystudies"
+  "vivax-staging.malariagen.net": "roma-staging"
+  "vobs-staging.malariagen.net": "roma-staging"
+  "genre-staging.malariagen.net": "roma-staging"
+  "genre.malariagen.net": "glad"
+cacheDir: "./.cache"
