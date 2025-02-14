@@ -1,5 +1,5 @@
 # Build stage: use Alpine-based Golang image and install CA certificates.
-FROM golang:1.20-alpine AS builder
+FROM golang:1.23.1-alpine AS builder
 
 # Install CA certificates.
 RUN apk add --no-cache ca-certificates
