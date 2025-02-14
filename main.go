@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,16 +27,36 @@ import (
 // Config & Data Structures
 // ----------------------------------------------------------------------
 
+// EnvPattern holds a regex pattern and the corresponding environment label.
+type EnvPattern struct {
+	Pattern string `yaml:"pattern"`
+	Env     string `yaml:"env"`
+}
+
+// GroupPattern holds a regex pattern and the corresponding group label.
+type GroupPattern struct {
+	Pattern string `yaml:"pattern"`
+	Group   string `yaml:"group"`
+}
+
+// RenamePattern holds a regex pattern and the corresponding new app name.
+type RenamePattern struct {
+	Pattern string `yaml:"pattern"`
+	NewName string `yaml:"newName"`
+}
+
 // Config holds all configuration options.
 type Config struct {
-	Retention    int               `yaml:"retention"` // in days
-	LatestScan   bool              `yaml:"latestScan"`
-	UpdatePeriod int               `yaml:"updatePeriod"` // in minutes
-	LogLevel     string            `yaml:"loglevel"`
-	Severities   []string          `yaml:"severities"`
-	DummyApps    []App             `yaml:"dummyApps"`
-	RenameApps   map[string]string `yaml:"renameApps"` // mapping: original app name -> new app name
-	CacheDir     string            `yaml:"cacheDir"`   // folder to cache raw API responses
+	Retention      int             `yaml:"retention"` // in days
+	LatestScan     bool            `yaml:"latestScan"`
+	UpdatePeriod   int             `yaml:"updatePeriod"` // in minutes
+	LogLevel       string          `yaml:"loglevel"`
+	Severities     []string        `yaml:"severities"`
+	DummyApps      []App           `yaml:"dummyApps"`
+	RenamePatterns []RenamePattern `yaml:"renamePatterns"` // pattern-based renaming
+	CacheDir       string          `yaml:"cacheDir"`       // folder to cache raw API responses
+	EnvPatterns    []EnvPattern    `yaml:"envPatterns"`    // for environment labeling
+	GroupPatterns  []GroupPattern  `yaml:"groupPatterns"`  // for app grouping
 }
 
 // App represents a single app from the apps API (or a dummy app).
@@ -94,27 +115,31 @@ var (
 	appMap   = make(map[string]string)
 	appMapMu sync.RWMutex
 
-	// renameAppsMap holds the mapping to transform app names.
-	renameAppsMap map[string]string
+	// renamePatterns holds the rename patterns (instead of a simple map).
+	renamePatterns []RenamePattern
 
 	// vulnerabilityCountGauge aggregates vulnerability counts by app name (transformed),
-	// severity, and state. The state label is "live" for live data and "dummy" for dummy apps.
+	// severity, state ("live" or "dummy"), scan_date, env and group.
 	vulnerabilityCountGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "rapid7_vulnerabilities_count",
-			Help: "Count of vulnerabilities per app by severity and state (live or dummy).",
+			Help: "Count of vulnerabilities per app by severity, state (live/dummy), scan_date, env, and group.",
 		},
-		[]string{"app_name", "severity", "state"},
+		[]string{"app_name", "severity", "state", "scan_date", "env", "group"},
 	)
 
 	mu sync.Mutex
 
-	// Allowed severities and dummy apps as determined by configuration.
+	// Allowed severities and dummy apps from configuration.
 	allowedSeverities []string
 	dummyAppsList     []App
 
 	// Cache directory for raw API responses.
 	cacheDir string
+
+	// Environment and group patterns.
+	envPatterns   []EnvPattern
+	groupPatterns []GroupPattern
 )
 
 // ----------------------------------------------------------------------
@@ -154,7 +179,7 @@ func maskURL(u string) string {
 	return parsed.String()
 }
 
-// isAllowedSeverity returns true if sev is in the allowed list (case‑insensitive).
+// isAllowedSeverity returns true if sev is in the allowed list (case-insensitive).
 func isAllowedSeverity(sev string, allowed []string) bool {
 	for _, a := range allowed {
 		if strings.EqualFold(a, sev) {
@@ -164,63 +189,23 @@ func isAllowedSeverity(sev string, allowed []string) bool {
 	return false
 }
 
-// updateGauge aggregates counts by transformed app name and updates the gauge.
-// For live data, the state label is set to "live".
-// For dummy apps, only a "LOW" severity entry with value 0 is added with state "dummy".
-func updateGauge(aggregatedCounts map[string]map[string]int, dummyApps []App, allowed []string) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Reset the gauge.
-	vulnerabilityCountGauge.Reset()
-
-	// Build a new map grouping by transformed app name.
-	finalCounts := make(map[string]map[string]int)
-	for appID, severityCounts := range aggregatedCounts {
-		appMapMu.RLock()
-		appName, exists := appMap[appID]
-		appMapMu.RUnlock()
-		if !exists {
-			appName = "unknown"
-		}
-		// Apply transformation if configured.
-		if newName, ok := renameAppsMap[appName]; ok {
-			appName = newName
-		}
-		if _, exists := finalCounts[appName]; !exists {
-			finalCounts[appName] = make(map[string]int)
-		}
-		for sev, count := range severityCounts {
-			finalCounts[appName][sev] += count
+// getScanDate returns the scan date in YYYY-MM-DD format from a vulnerability's LastDiscovered.
+func getScanDate(v Vulnerability) string {
+	timeStr := v.LastDiscovered
+	if len(timeStr) > 0 {
+		lastChar := timeStr[len(timeStr)-1]
+		if lastChar >= '0' && lastChar <= '9' {
+			timeStr += "Z"
 		}
 	}
-
-	// Update gauge for live data.
-	for appName, severityCounts := range finalCounts {
-		for sev, count := range severityCounts {
-			vulnerabilityCountGauge.With(prometheus.Labels{
-				"app_name": appName,
-				"severity": sev,
-				"state":    "live",
-			}).Set(float64(count))
+	t, err := time.Parse(time.RFC3339Nano, timeStr)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, timeStr)
+		if err != nil {
+			return "unknown"
 		}
 	}
-
-	// Add dummy apps: for each dummy app (by its transformed name) that is not already present, add only a "LOW" entry with 0.
-	for _, dummyApp := range dummyApps {
-		dummyName := dummyApp.Name
-		if newName, ok := renameAppsMap[dummyName]; ok {
-			dummyName = newName
-		}
-		if _, exists := finalCounts[dummyName]; !exists {
-			// Add dummy app with state "dummy" and LOW severity 0.
-			vulnerabilityCountGauge.With(prometheus.Labels{
-				"app_name": dummyName,
-				"severity": "LOW",
-				"state":    "dummy",
-			}).Set(0)
-		}
-	}
+	return t.Format("2006-01-02")
 }
 
 // extractScanID parses the given HTTP request text (from a variance) and returns the scan id.
@@ -238,16 +223,225 @@ func extractScanID(requestText string) string {
 	return ""
 }
 
+// getEnvironment checks the app name against the list of environment patterns.
+func getEnvironment(appName string, patterns []EnvPattern) (string, bool) {
+	for _, ep := range patterns {
+		matched, err := regexp.MatchString(ep.Pattern, appName)
+		if err == nil && matched {
+			return ep.Env, true
+		}
+	}
+	return "", false
+}
+
+// getGroup checks the app name against the list of group patterns.
+func getGroup(appName string, patterns []GroupPattern) (string, bool) {
+	for _, gp := range patterns {
+		matched, err := regexp.MatchString(gp.Pattern, appName)
+		if err == nil && matched {
+			return gp.Group, true
+		}
+	}
+	return "", false
+}
+
+// applyRename applies rename patterns to an app name.
+// For each rename pattern, if the regex pattern matches, it replaces the matched part
+// with the provided newName (using regexp.ReplaceAllString) and returns the result.
+// If no pattern matches, the original app name is returned.
+func applyRename(appName string, patterns []RenamePattern) string {
+	for _, rp := range patterns {
+		re, err := regexp.Compile(rp.Pattern)
+		if err != nil {
+			log.Error().Err(err).Msgf("Invalid rename pattern: %s", rp.Pattern)
+			continue
+		}
+		if re.MatchString(appName) {
+			return re.ReplaceAllString(appName, rp.NewName)
+		}
+	}
+	return appName
+}
+
 // ----------------------------------------------------------------------
-// Fetching Data
+// Gauge Update Functions
+// ----------------------------------------------------------------------
+
+// updateGaugeNormal aggregates live data from normal processing.
+// aggregatedCounts is a map: appID -> scan_date -> severity -> count.
+func updateGaugeNormal(aggregatedCounts map[string]map[string]map[string]int, dummyApps []App, allowed []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	vulnerabilityCountGauge.Reset()
+	// finalCounts: compositeKey = finalName|env|group -> scan_date -> severity -> count.
+	finalCounts := make(map[string]map[string]map[string]int)
+	for appID, dateMap := range aggregatedCounts {
+		appMapMu.RLock()
+		origName, exists := appMap[appID]
+		appMapMu.RUnlock()
+		if !exists {
+			origName = "unknown"
+		}
+		finalName := applyRename(origName, renamePatterns)
+		envVal, _ := getEnvironment(origName, envPatterns)
+		groupVal, _ := getGroup(origName, groupPatterns)
+		compositeKey := finalName + "|" + envVal + "|" + groupVal
+		if _, exists := finalCounts[compositeKey]; !exists {
+			finalCounts[compositeKey] = make(map[string]map[string]int)
+		}
+		for scanDate, sevMap := range dateMap {
+			if _, exists := finalCounts[compositeKey][scanDate]; !exists {
+				finalCounts[compositeKey][scanDate] = make(map[string]int)
+			}
+			for sev, count := range sevMap {
+				finalCounts[compositeKey][scanDate][sev] += count
+			}
+		}
+	}
+	// Update gauge for live data.
+	for compositeKey, dateMap := range finalCounts {
+		parts := strings.SplitN(compositeKey, "|", 3)
+		finalName := parts[0]
+		envVal := ""
+		groupVal := ""
+		if len(parts) > 1 {
+			envVal = parts[1]
+		}
+		if len(parts) > 2 {
+			groupVal = parts[2]
+		}
+		for scanDate, sevMap := range dateMap {
+			for sev, count := range sevMap {
+				vulnerabilityCountGauge.With(prometheus.Labels{
+					"app_name":  finalName,
+					"severity":  sev,
+					"state":     "live",
+					"scan_date": scanDate,
+					"env":       envVal,
+					"group":     groupVal,
+				}).Set(float64(count))
+			}
+		}
+	}
+	// Add dummy apps: add only a "LOW" entry with state "dummy", scan_date "n/a", and env/group from pattern matching.
+	for _, dummyApp := range dummyApps {
+		origName := dummyApp.Name
+		finalName := applyRename(origName, renamePatterns)
+		envVal, _ := getEnvironment(origName, envPatterns)
+		groupVal, _ := getGroup(origName, groupPatterns)
+		compositeKey := finalName + "|" + envVal + "|" + groupVal
+		found := false
+		for _, dateMap := range finalCounts {
+			if _, exists := dateMap[compositeKey]; exists {
+				found = true
+				break
+			}
+		}
+		if !found {
+			vulnerabilityCountGauge.With(prometheus.Labels{
+				"app_name":  finalName,
+				"severity":  "LOW",
+				"state":     "dummy",
+				"scan_date": "n/a",
+				"env":       envVal,
+				"group":     groupVal,
+			}).Set(0)
+		}
+	}
+}
+
+// updateGaugeLatest aggregates live data from latest scan processing.
+// aggregatedCounts is a map: appID -> severity -> count.
+// chosenScanDates maps appID to the chosen scan date (formatted as "YYYY-MM-DD").
+// Grouping is done by composite key: finalName|env|group.
+func updateGaugeLatest(aggregatedCounts map[string]map[string]int, chosenScanDates map[string]string, dummyApps []App, allowed []string) {
+	mu.Lock()
+	defer mu.Unlock()
+	vulnerabilityCountGauge.Reset()
+	finalCounts := make(map[string]map[string]int) // finalCounts[compositeKey][severity]
+	finalScanDates := make(map[string]string)      // finalScanDates[compositeKey] = latest scan date
+	for appID, sevMap := range aggregatedCounts {
+		appMapMu.RLock()
+		origName, exists := appMap[appID]
+		appMapMu.RUnlock()
+		if !exists {
+			origName = "unknown"
+		}
+		finalName := applyRename(origName, renamePatterns)
+		envVal, _ := getEnvironment(origName, envPatterns)
+		groupVal, _ := getGroup(origName, groupPatterns)
+		compositeKey := finalName + "|" + envVal + "|" + groupVal
+		if _, exists := finalCounts[compositeKey]; !exists {
+			finalCounts[compositeKey] = make(map[string]int)
+		}
+		for sev, count := range sevMap {
+			finalCounts[compositeKey][sev] += count
+		}
+		scanDate, ok := chosenScanDates[appID]
+		if !ok {
+			scanDate = "unknown"
+		}
+		if cur, exists := finalScanDates[compositeKey]; !exists {
+			finalScanDates[compositeKey] = scanDate
+		} else {
+			if scanDate > cur {
+				finalScanDates[compositeKey] = scanDate
+			}
+		}
+	}
+	// Update gauge for live data.
+	for compositeKey, sevMap := range finalCounts {
+		parts := strings.SplitN(compositeKey, "|", 3)
+		finalName := parts[0]
+		envVal := ""
+		groupVal := ""
+		if len(parts) > 1 {
+			envVal = parts[1]
+		}
+		if len(parts) > 2 {
+			groupVal = parts[2]
+		}
+		scanDate := finalScanDates[compositeKey]
+		for sev, count := range sevMap {
+			vulnerabilityCountGauge.With(prometheus.Labels{
+				"app_name":  finalName,
+				"severity":  sev,
+				"state":     "live",
+				"scan_date": scanDate,
+				"env":       envVal,
+				"group":     groupVal,
+			}).Set(float64(count))
+		}
+	}
+	// Add dummy apps.
+	for _, dummyApp := range dummyApps {
+		origName := dummyApp.Name
+		finalName := applyRename(origName, renamePatterns)
+		envVal, _ := getEnvironment(origName, envPatterns)
+		groupVal, _ := getGroup(origName, groupPatterns)
+		compositeKey := finalName + "|" + envVal + "|" + groupVal
+		if _, exists := finalCounts[compositeKey]; !exists {
+			vulnerabilityCountGauge.With(prometheus.Labels{
+				"app_name":  finalName,
+				"severity":  "LOW",
+				"state":     "dummy",
+				"scan_date": "n/a",
+				"env":       envVal,
+				"group":     groupVal,
+			}).Set(0)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------
+// Fetching Data: Vulnerabilities and Apps
 // ----------------------------------------------------------------------
 
 // fetchApps retrieves the list of apps from the Rapid7 Apps API and updates appMap.
-// If caching is enabled (cacheDir is set), it will reuse the cached response if it is not older than (updatePeriod - 10 minutes).
+// If caching is enabled, it reuses cached data if it’s not older than (updatePeriod - 10 minutes).
 func fetchApps(apiKey string, cacheDuration time.Duration) {
 	appsURL := "https://eu.api.insight.rapid7.com/ias/v1/apps"
 	log.Info().Msgf("Fetching apps from URL: %s", maskURL(appsURL))
-
 	var data []byte
 	var err error
 	cacheFile := ""
@@ -259,7 +453,6 @@ func fetchApps(apiKey string, cacheDuration time.Duration) {
 			log.Info().Msg("Using cached apps data")
 		}
 	}
-
 	if data == nil {
 		req, err := http.NewRequest("GET", appsURL, nil)
 		if err != nil {
@@ -268,7 +461,6 @@ func fetchApps(apiKey string, cacheDuration time.Duration) {
 		}
 		req.Header.Set("X-Api-Key", apiKey)
 		req.Header.Set("Content-Type", "application/json")
-
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -276,13 +468,11 @@ func fetchApps(apiKey string, cacheDuration time.Duration) {
 			return
 		}
 		defer resp.Body.Close()
-
 		data, err = ioutil.ReadAll(resp.Body)
 		if err != nil {
 			log.Error().Err(err).Msg("Error reading apps API response")
 			return
 		}
-
 		if cacheFile != "" {
 			if err := saveCache(cacheFile, data); err != nil {
 				log.Error().Err(err).Msg("Error saving apps cache")
@@ -291,35 +481,29 @@ func fetchApps(apiKey string, cacheDuration time.Duration) {
 			}
 		}
 	}
-
 	var appsResp AppsResponse
 	if err := json.Unmarshal(data, &appsResp); err != nil {
 		log.Error().Err(err).Msg("Error decoding apps API response")
 		return
 	}
-
 	newMap := make(map[string]string)
 	for _, app := range appsResp.Data {
 		newMap[app.ID] = app.Name
 	}
-
 	appMapMu.Lock()
 	appMap = newMap
 	appMapMu.Unlock()
-
 	log.Info().Msgf("Fetched %d apps from the apps API", len(newMap))
 }
 
-// fetchVulnerabilities retrieves vulnerabilities page by page from the Rapid7 API.
-// It applies the retention filter (if set) and allowed severities filtering.
-// If latestScan is false, all vulnerabilities (that pass filters) are aggregated by app.
-// If latestScan is true, vulnerabilities are grouped by app and by scan (using scan id) and only the latest scan is used.
-// For performance, if cacheDir is set, raw JSON responses are cached and reused if not older than (updatePeriod - 10 minutes).
+// fetchVulnerabilities retrieves vulnerabilities from the Rapid7 API.
+// It applies retention and severity filters. In normal mode, data is grouped by app and scan_date;
+// in latestScan mode, data is grouped by app and scan (using scanID) and only the latest scan is chosen.
+// Raw responses are cached if enabled.
 func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cacheDuration time.Duration) {
 	baseURL := "https://eu.api.insight.rapid7.com/ias/v1/vulnerabilities"
 	currentIndex := 0
 	client := &http.Client{}
-
 	var retentionTime time.Time
 	if retentionDays > 0 {
 		retentionTime = time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
@@ -327,10 +511,9 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 	} else {
 		log.Info().Msg("No retention filter set; including all vulnerabilities")
 	}
-
-	// ----- Normal Processing -----
+	// ----- Normal Processing: Group by app and scan_date -----
 	if !latestScan {
-		aggregatedCounts := make(map[string]map[string]int)
+		aggregatedCounts := make(map[string]map[string]map[string]int) // appID -> scan_date -> severity -> count
 		for {
 			currentURL := baseURL + "?index=" + strconv.Itoa(currentIndex) + "&size=50&sort=vulnerability.severity,desc"
 			log.Info().Msgf("Fetching vulnerabilities from URL: %s", maskURL(currentURL))
@@ -340,35 +523,33 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 			if cacheDir != "" && cacheDuration > 0 {
 				vulnCacheDir := cacheDir + "/vulnerabilities"
 				os.MkdirAll(vulnCacheDir, 0755)
-				cacheFile = vulnCacheDir + "/vulnerabilities_page_" + strconv.Itoa(currentIndex) + ".json"
+				cacheFile = fmt.Sprintf("%s/vulnerabilities_page_%d.json", vulnCacheDir, currentIndex)
 				data, err = getCachedResponse(cacheFile, cacheDuration)
 				if err == nil {
 					log.Info().Msgf("Using cached vulnerabilities data for page %d", currentIndex)
 				}
 			}
-
 			if data == nil {
-				req, err := http.NewRequest("GET", currentURL, nil)
+				var req *http.Request
+				req, err = http.NewRequest("GET", currentURL, nil)
 				if err != nil {
 					log.Error().Err(err).Msgf("Error creating request for URL: %s", currentURL)
 					return
 				}
 				req.Header.Set("X-Api-Key", apiKey)
 				req.Header.Set("Content-Type", "application/json")
-
-				resp, err := client.Do(req)
+				var resp *http.Response
+				resp, err = client.Do(req)
 				if err != nil {
 					log.Error().Err(err).Msgf("Error making request to URL: %s", currentURL)
 					return
 				}
-
 				data, err = ioutil.ReadAll(resp.Body)
 				resp.Body.Close()
 				if err != nil {
 					log.Error().Err(err).Msgf("Error reading response from URL: %s", currentURL)
 					return
 				}
-
 				if cacheFile != "" {
 					if err := saveCache(cacheFile, data); err != nil {
 						log.Error().Err(err).Msg("Error saving vulnerabilities cache")
@@ -377,17 +558,14 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 					}
 				}
 			}
-
 			var vResp VulnerabilitiesResponse
 			if err := json.Unmarshal(data, &vResp); err != nil {
 				log.Error().Err(err).Msgf("Error decoding JSON response from URL: %s", currentURL)
 				return
 			}
-
 			log.Info().Msgf("Fetched %d vulnerabilities from page index %d", len(vResp.Data), currentIndex)
-
 			for _, vuln := range vResp.Data {
-				// Apply retention filter.
+				// Retention filter.
 				if retentionDays > 0 {
 					timeStr := vuln.FirstDiscovered
 					if len(timeStr) > 0 {
@@ -396,7 +574,8 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 							timeStr += "Z"
 						}
 					}
-					discovered, err := time.Parse(time.RFC3339Nano, timeStr)
+					var discovered time.Time
+					discovered, err = time.Parse(time.RFC3339Nano, timeStr)
 					if err != nil {
 						discovered, err = time.Parse(time.RFC3339, timeStr)
 						if err != nil {
@@ -409,25 +588,25 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 						continue
 					}
 				}
-
 				// Filter by allowed severities.
 				if len(allowedSeverities) > 0 && !isAllowedSeverity(vuln.Severity, allowedSeverities) {
 					continue
 				}
-
 				appID := vuln.App.ID
 				if appID == "" {
 					continue
 				}
+				scanDate := getScanDate(vuln)
 				if _, exists := aggregatedCounts[appID]; !exists {
-					aggregatedCounts[appID] = make(map[string]int)
+					aggregatedCounts[appID] = make(map[string]map[string]int)
 				}
-				aggregatedCounts[appID][vuln.Severity]++
+				if _, exists := aggregatedCounts[appID][scanDate]; !exists {
+					aggregatedCounts[appID][scanDate] = make(map[string]int)
+				}
+				aggregatedCounts[appID][scanDate][vuln.Severity]++
 			}
-
-			updateGauge(aggregatedCounts, dummyAppsList, allowedSeverities)
+			updateGaugeNormal(aggregatedCounts, dummyAppsList, allowedSeverities)
 			log.Info().Msgf("Updated aggregated counts for %d apps so far", len(aggregatedCounts))
-
 			if currentIndex+1 < vResp.Metadata.TotalPages {
 				currentIndex++
 				log.Info().Msgf("Moving to next page, index: %d", currentIndex)
@@ -439,12 +618,13 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 		return
 	}
 
-	// ----- Latest Scan Processing -----
+	// ----- Latest Scan Processing: Group by app and scan (using scanID) -----
 	type ScanAggregation struct {
 		SeverityCounts    map[string]int
 		MaxLastDiscovered time.Time
 	}
-	appScanAgg := make(map[string]map[string]*ScanAggregation)
+	appScanAgg := make(map[string]map[string]*ScanAggregation) // appID -> scanID -> aggregation
+	chosenScanDates := make(map[string]string)                 // appID -> chosen scan date
 	for {
 		currentURL := baseURL + "?index=" + strconv.Itoa(currentIndex) + "&size=50&sort=vulnerability.severity,desc"
 		log.Info().Msgf("Fetching vulnerabilities from URL: %s", maskURL(currentURL))
@@ -454,22 +634,23 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 		if cacheDir != "" && cacheDuration > 0 {
 			vulnCacheDir := cacheDir + "/vulnerabilities"
 			os.MkdirAll(vulnCacheDir, 0755)
-			cacheFile = vulnCacheDir + "/vulnerabilities_page_" + strconv.Itoa(currentIndex) + ".json"
+			cacheFile = fmt.Sprintf("%s/vulnerabilities_page_%d.json", vulnCacheDir, currentIndex)
 			data, err = getCachedResponse(cacheFile, cacheDuration)
 			if err == nil {
 				log.Info().Msgf("Using cached vulnerabilities data for page %d", currentIndex)
 			}
 		}
 		if data == nil {
-			req, err := http.NewRequest("GET", currentURL, nil)
+			var req *http.Request
+			req, err = http.NewRequest("GET", currentURL, nil)
 			if err != nil {
 				log.Error().Err(err).Msgf("Error creating request for URL: %s", currentURL)
 				return
 			}
 			req.Header.Set("X-Api-Key", apiKey)
 			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := client.Do(req)
+			var resp *http.Response
+			resp, err = client.Do(req)
 			if err != nil {
 				log.Error().Err(err).Msgf("Error making request to URL: %s", currentURL)
 				return
@@ -493,11 +674,9 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 			log.Error().Err(err).Msgf("Error decoding JSON response from URL: %s", currentURL)
 			return
 		}
-
 		log.Info().Msgf("Fetched %d vulnerabilities from page index %d", len(vResp.Data), currentIndex)
-
 		for _, vuln := range vResp.Data {
-			// Apply retention filter.
+			// Retention filter.
 			if retentionDays > 0 {
 				timeStr := vuln.FirstDiscovered
 				if len(timeStr) > 0 {
@@ -506,7 +685,8 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 						timeStr += "Z"
 					}
 				}
-				discovered, err := time.Parse(time.RFC3339Nano, timeStr)
+				var discovered time.Time
+				discovered, err = time.Parse(time.RFC3339Nano, timeStr)
 				if err != nil {
 					discovered, err = time.Parse(time.RFC3339, timeStr)
 					if err != nil {
@@ -519,17 +699,14 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 					continue
 				}
 			}
-
 			// Filter by allowed severities.
 			if len(allowedSeverities) > 0 && !isAllowedSeverity(vuln.Severity, allowedSeverities) {
 				continue
 			}
-
 			appID := vuln.App.ID
 			if appID == "" {
 				continue
 			}
-
 			// Extract scan id.
 			scanID := ""
 			for _, variance := range vuln.Variances {
@@ -542,7 +719,6 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 				log.Debug().Msgf("No scan id found for vulnerability %s; skipping", vuln.ID)
 				continue
 			}
-
 			// Parse last_discovered.
 			timeStr := vuln.LastDiscovered
 			if len(timeStr) > 0 {
@@ -551,7 +727,8 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 					timeStr += "Z"
 				}
 			}
-			lastDiscovered, err := time.Parse(time.RFC3339Nano, timeStr)
+			var lastDiscovered time.Time
+			lastDiscovered, err = time.Parse(time.RFC3339Nano, timeStr)
 			if err != nil {
 				lastDiscovered, err = time.Parse(time.RFC3339, timeStr)
 				if err != nil {
@@ -559,7 +736,6 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 					continue
 				}
 			}
-
 			if _, exists := appScanAgg[appID]; !exists {
 				appScanAgg[appID] = make(map[string]*ScanAggregation)
 			}
@@ -576,7 +752,6 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 				agg.MaxLastDiscovered = lastDiscovered
 			}
 		}
-
 		if currentIndex+1 < vResp.Metadata.TotalPages {
 			currentIndex++
 			log.Info().Msgf("Moving to next page, index: %d", currentIndex)
@@ -585,9 +760,9 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 			break
 		}
 	}
-
 	// For each app, choose the scan with the latest last_discovered.
-	aggregatedCounts := make(map[string]map[string]int)
+	aggregatedCounts := make(map[string]map[string]int) // appID -> severity -> count
+	chosenScanDates = make(map[string]string)           // appID -> chosen scan date
 	for appID, scanMap := range appScanAgg {
 		var chosenScanID string
 		var maxTime time.Time
@@ -599,10 +774,10 @@ func fetchVulnerabilities(apiKey string, retentionDays int, latestScan bool, cac
 		}
 		if chosenScanID != "" {
 			aggregatedCounts[appID] = scanMap[chosenScanID].SeverityCounts
+			chosenScanDates[appID] = maxTime.Format("2006-01-02")
 		}
 	}
-
-	updateGauge(aggregatedCounts, dummyAppsList, allowedSeverities)
+	updateGaugeLatest(aggregatedCounts, chosenScanDates, dummyAppsList, allowedSeverities)
 	log.Info().Msgf("Updated aggregated counts for %d apps using latest scan filtering", len(aggregatedCounts))
 }
 
@@ -645,8 +820,10 @@ func main() {
 		logLevelStr = cfg.LogLevel
 		allowedSeverities = cfg.Severities
 		dummyAppsList = cfg.DummyApps
-		renameAppsMap = cfg.RenameApps
+		renamePatterns = cfg.RenamePatterns
 		cacheDir = cfg.CacheDir
+		envPatterns = cfg.EnvPatterns
+		groupPatterns = cfg.GroupPatterns
 		log.Info().Msg("Loaded configuration from file")
 	} else {
 		if severitiesStr != "" {
@@ -659,19 +836,21 @@ func main() {
 			allowedSeverities = []string{}
 		}
 		dummyAppsList = []App{}
-		renameAppsMap = make(map[string]string)
+		renamePatterns = []RenamePattern{}
 		cacheDir = cacheDirFlag
+		envPatterns = []EnvPattern{}
+		groupPatterns = []GroupPattern{}
 	}
 
-	// Configure zerolog for colorful, human-friendly output.
+	// Configure zerolog.
 	consoleWriter := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}
 	log.Logger = log.Output(consoleWriter)
-	level, err := zerolog.ParseLevel(logLevelStr)
+	parsedLevel, err := zerolog.ParseLevel(logLevelStr)
 	if err != nil {
 		log.Warn().Msgf("Invalid log level '%s', defaulting to 'warn'", logLevelStr)
-		level = zerolog.WarnLevel
+		parsedLevel = zerolog.WarnLevel
 	}
-	zerolog.SetGlobalLevel(level)
+	zerolog.SetGlobalLevel(parsedLevel)
 
 	apiKey := os.Getenv("RAPID7_API_KEY")
 	if apiKey == "" {
@@ -707,7 +886,7 @@ func main() {
 	}()
 
 	http.Handle("/metrics", promhttp.Handler())
-	log.Info().Msg("Rapid7 vulnerability exporter running on :9090/metrics")
+	log.Info().Msg("rapid7exporter running on :9090/metrics")
 	if err := http.ListenAndServe(":9090", nil); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
 	}

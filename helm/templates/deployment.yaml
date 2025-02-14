@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rapid7exporter.fullname" . }}
+  labels:
+    app: {{ include "rapid7exporter.name" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "rapid7exporter.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "rapid7exporter.name" . }}
+    spec:
+      serviceAccountName: {{ include "rapid7exporter.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.podSecurityContext.runAsUser }}
+        fsGroup: {{ .Values.podSecurityContext.fsGroup }}
+      containers:
+        - name: rapid7exporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          volumeMounts:
+            - name: config-volume
+              mountPath: /config
+              readOnly: true
+            - name: cache-volume
+              mountPath: /cache
+          env:
+            - name: RAPID7_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rapid7exporter-secret
+                  key: rapid7ApiKey
+            - name: CONFIG_FILE
+              value: "/config/config.yaml"
+          securityContext:
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: config-volume
+          configMap:
+            name: {{ include "rapid7exporter.fullname" . }}-config
+        - name: cache-volume
+          emptyDir: {}

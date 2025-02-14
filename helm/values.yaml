@@ -1,0 +1,63 @@
+replicaCount: 1
+
+image:
+  repository: mtrb/rapid7exporter
+  tag: "1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 9090
+
+# Configuration for rapid7exporter (this will be loaded as a ConfigMap)
+config: |-
+  retention: 7
+  latestScan: true
+  updatePeriod: 20
+  loglevel: debug
+  severities:
+    - CRITICAL
+    - HIGH
+    - MEDIUM
+    - LOW
+  dummyApps:
+    - id: "dummy-001"
+      name: "App To Onboard 1"
+    - id: "dummy-002"
+      name: "App To Onboard 2"
+  renamePatterns:
+    - pattern: "(?i)Legacy App"
+      newName: "Unified App"
+  cacheDir: "/cache"
+  envPatterns:
+    - pattern: "(?i).*staging.*"
+      env: "staging"
+    - pattern: "(?i).*dev.*"
+      env: "dev"
+  groupPatterns:
+    - pattern: "(?i)^Group A.*"
+      group: "Group A"
+    - pattern: "(?i)^Group B.*"
+      group: "Group B"
+
+# Security and Pod settings
+podSecurityContext:
+  runAsUser: 1000
+  fsGroup: 2000
+  runAsNonRoot: true
+
+securityContext:
+  allowPrivilegeEscalation: false
+
+# Cache volume configuration (emptyDir)
+cacheVolume:
+  emptyDir: {}
+
+# Service account settings (if you want to create a dedicated one)
+serviceAccount:
+  create: true
+  name: ""
+
+# Additional configuration to override command-line flags if desired.
+# These values are passed into the container as environment variables.
+configOverrides: {}

@@ -1,7 +1,7 @@
-retention: 130
+retention: 230
 latestScan: true
 updatePeriod: 1440
-loglevel: warn
+loglevel: info
 severities:
   - CRITICAL
   - HIGH
@@ -10,14 +10,41 @@ severities:
 dummyApps:
   - id: "dummy-001"
     name: "pf-haptoatlas"
-renameApps:
-  "vivax.malariagen.net": "roma"
-  "spotmalaria.malariagen.net": "roma"
-  "vobs.malariagen.net": "roma"
-  "glad.malariagen.net": "roma"
-  "lookseq-mystudies-uat.gsu.sanger.ac.uk/mystudies": "mystudies"
-  "vivax-staging.malariagen.net": "roma-staging"
-  "vobs-staging.malariagen.net": "roma-staging"
-  "genre-staging.malariagen.net": "roma-staging"
-  "genre.malariagen.net": "glad"
+renamePatterns:
+  - pattern: ".*mystudies.*"
+    newName: "mystudies"
+  - pattern: ".*alfresco.*"
+    newName: "alfresco"
+  - pattern: "vivax.*"
+    newName: "roma-vivax"
+  - pattern: "spotmalaria.*"
+    newName: "roma-spotmalaria"
+  - pattern: "vobs.*"
+    newName: "roma-vobs"
+  - pattern: "^genre.*"
+    newName: "roma-genre"
+  - pattern: ".*glad.*"
+    newName: "glad"
+envPatterns:
+  - pattern: "^.*-staging.*"
+    env: "staging"
+  - pattern: "^.*-dev.*"
+    env: "dev"
+  - pattern: "^.*-uat.*"
+    env: "uat"
+  - pattern: "^.*-test.*"
+    env: "test"
+  - pattern: ".*"
+    env: "production"
+groupPatterns:
+  - pattern: "^.*vivax.*"
+    group: "roma"
+  - pattern: "^.*vobs.*"
+    group: "roma"
+  - pattern: "^.*genre.*"
+    group: "roma"
+  - pattern: "^.*spotmalaria.*"
+    group: "roma"
+  - pattern: ".*alfres.*"
+    group: "alfresco"
 cacheDir: "./.cache"
