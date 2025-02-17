@@ -47,4 +47,3 @@ groupPatterns:
     group: "roma"
   - pattern: ".*alfres.*"
     group: "alfresco"
-cacheDir: "./.cache"

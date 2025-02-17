@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: mtrb/rapid7exporter
-  tag: "1.0"
+  tag: "main"
   pullPolicy: IfNotPresent
 
 service:
@@ -11,10 +11,10 @@ service:
 
 # Configuration for rapid7exporter (this will be loaded as a ConfigMap)
 config: |-
-  retention: 7
+  retention: 230
   latestScan: true
-  updatePeriod: 20
-  loglevel: debug
+  updatePeriod: 1440
+  loglevel: info
   severities:
     - CRITICAL
     - HIGH
@@ -22,23 +22,44 @@ config: |-
     - LOW
   dummyApps:
     - id: "dummy-001"
-      name: "App To Onboard 1"
-    - id: "dummy-002"
-      name: "App To Onboard 2"
+      name: "pf-haptoatlas"
   renamePatterns:
-    - pattern: "(?i)Legacy App"
-      newName: "Unified App"
-  cacheDir: "/cache"
+    - pattern: ".*mystudies.*"
+      newName: "mystudies"
+    - pattern: ".*alfresco.*"
+      newName: "alfresco"
+    - pattern: "vivax.*"
+      newName: "roma-vivax"
+    - pattern: "spotmalaria.*"
+      newName: "roma-spotmalaria"
+    - pattern: "vobs.*"
+      newName: "roma-vobs"
+    - pattern: "^genre.*"
+      newName: "roma-genre"
+    - pattern: ".*glad.*"
+      newName: "glad"
   envPatterns:
-    - pattern: "(?i).*staging.*"
+    - pattern: "^.*-staging.*"
       env: "staging"
-    - pattern: "(?i).*dev.*"
+    - pattern: "^.*-dev.*"
       env: "dev"
+    - pattern: "^.*-uat.*"
+      env: "uat"
+    - pattern: "^.*-test.*"
+      env: "test"
+    - pattern: ".*"
+      env: "production"
   groupPatterns:
-    - pattern: "(?i)^Group A.*"
-      group: "Group A"
-    - pattern: "(?i)^Group B.*"
-      group: "Group B"
+    - pattern: "^.*vivax.*"
+      group: "roma"
+    - pattern: "^.*vobs.*"
+      group: "roma"
+    - pattern: "^.*genre.*"
+      group: "roma"
+    - pattern: "^.*spotmalaria.*"
+      group: "roma"
+    - pattern: ".*alfres.*"
+      group: "alfresco"
 
 # Security and Pod settings
 podSecurityContext:
@@ -55,7 +76,7 @@ cacheVolume:
 
 # Service account settings (if you want to create a dedicated one)
 serviceAccount:
-  create: true
+  create: false
   name: ""
 
 # Additional configuration to override command-line flags if desired.

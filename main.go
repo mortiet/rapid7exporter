@@ -804,6 +804,11 @@ func main() {
 	flag.StringVar(&cacheDirFlag, "cacheDir", "", "Directory to cache raw API responses from Rapid7 (optional)")
 	flag.Parse()
 
+	// If the CONFIG_FILE environment variable is set, override the config file flag.
+	if envConfig := os.Getenv("CONFIG_FILE"); envConfig != "" {
+		configFile = envConfig
+	}
+
 	// Load configuration from YAML if provided.
 	if configFile != "" {
 		data, err := ioutil.ReadFile(configFile)
