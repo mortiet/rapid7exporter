@@ -1,0 +1,20 @@
+{{- if .Values.serviceMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rapid7exporter.fullname" . }}-sm
+  labels:
+    app: {{ include "rapid7exporter.name" . }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "rapid7exporter.name" . }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ default "30s" .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ default "10s" .Values.serviceMonitor.scrapeTimeout }}
+{{- end -}}

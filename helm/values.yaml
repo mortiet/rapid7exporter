@@ -70,6 +70,12 @@ podSecurityContext:
 securityContext:
   allowPrivilegeEscalation: false
 
+serviceMonitor:
+  enabled: true
+  interval: 10m
+  scrapeTimeout: 1m
+
+
 # Cache volume configuration (emptyDir)
 cacheVolume:
   emptyDir: {}
